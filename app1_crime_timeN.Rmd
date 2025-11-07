@@ -1,0 +1,322 @@
+---
+title: 'Appendix 1: Crime in time'
+output:
+  html_document:
+    code_folding: hide
+    df_print: paged
+  pdf_document: default
+---
+
+## 0. Data preparation
+
+The datasets used in the analysis:  
+- Arrests. NYPD arrests data (historic). https://catalog.data.gov/dataset/nypd-arrests-data-historic, 2020.  
+- Shooting. NYPD shooting incident data (historic). https://catalog.data.gov/dataset/nypd-shooting-incident-data-historic, 2020.
+
+
+First we load the data sets with arrests and shooting incidents in the years 2006-2023.
+```{r, results='hide',  message = FALSE, warning=FALSE}
+arrestH <- read.csv('NYPD_Arrests_Data__Historic_.csv')
+library(lubridate)
+library(dplyr)
+arrestH <- arrestH[!(is.na(arrestH$Longitude) | (arrestH$Longitude==0) ), ]
+arrestH <- subset(arrestH, select = -c(X_COORD_CD, Y_COORD_CD) )
+arrestH$ARREST_DATE <- mdy(arrestH$ARREST_DATE)
+arrestH$ARREST_BORO <- as.factor(arrestH$ARREST_BORO)
+arrestH$ARREST_PRECINCT <- as.factor(arrestH$ARREST_PRECINCT)
+arrestH <- arrestH[!(arrestH$ARREST_BORO == ""),]
+arrestH$ARREST_BORO <- as.factor(as.character(arrestH$ARREST_BORO))
+arrestH <- arrestH %>% filter(arrestH$Latitude < 41)
+levels(arrestH$ARREST_BORO)<- c("BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND")
+```
+
+```{r, results='hide'}
+shooting <- read.csv("NYPD_Shooting_Incident_Data__Historic_.csv")
+shooting <- shooting[!(is.na(shooting$Longitude) | (shooting$Longitude==0) ), ]
+shooting$OCCUR_DATE <- mdy(shooting$OCCUR_DATE)
+shooting$BORO <- as.factor(shooting$BORO)
+shooting$PRECINCT <- as.factor(shooting$PRECINCT)
+```
+
+We add the geospatial data to plot the map of the incidents:
+```{r,  message = FALSE}
+library(sf)
+library(ggplot2)
+library(viridis)
+nta <- read_sf("2020 Neighborhood Tabulation Areas (NTAs).geojson")
+ggplot() + geom_sf(data=nta, fill = "#69b3a2", color = "black", alpha=0.1) + theme_void() + geom_point(data=arrestH,aes(x = Longitude, y = Latitude, col = ARREST_BORO), size = 0.03) + ggtitle("Arrests incidents in 2005-2023") + scale_colour_viridis_d()
+```
+```{r}
+ggplot() + geom_sf(data=nta, fill ="#69b3a2", color = "black", alpha=0.1) + theme_void() + geom_point(data=shooting,aes(x = Longitude, y = Latitude, col = BORO), size = 0.05) + ggtitle("Shootings incidents in 2005-2023") + scale_colour_viridis_d()
+```
+
+
+## 1. Crime in Boroughs through time
+
+### 1.1 Arrests in boroughs
+
+First we calculate the number of arrests in a given borough per month:
+```{r, message=FALSE}
+arrestBoro.time <- arrestH %>% group_by(boro=ARREST_BORO, time = floor_date( ARREST_DATE, 'month')) %>% summarize(n_incident = n()) 
+
+ggplot(arrestBoro.time ,aes(x=time,y=n_incident, col=boro) )  +geom_line() + ggtitle("Arrests in Boroughs") + theme( axis.title.y = element_blank()) + scale_colour_viridis_d()# + geom_point() 
+```
+
+We see lower values around November - December. With fused lasso we can check if there is indeed a significant difference between seasons or not. We use genlasso package with cross-validation function in order to choose the optimal penalty parameter lambda:
+```{r, results='hide', message=FALSE , warning=FALSE}
+library(genlasso)
+# function to smooth data with fused lasso1d
+fused_Boro = function(dataset){
+  boro_set <- dataset[dataset$boro== "STATEN ISLAND",] 
+  a1 <- fusedlasso1d(boro_set$n_incident)
+  #plot(a1)
+  par(mfrow=c(2,3))
+  plot(a1, style="path")
+  
+  # Choose lambda by 5-fold cross-validation
+  cv.a1 = cv.trendfilter(a1)
+  plot(cv.a1)
+  title(main="STATEN ISLAND")
+  sol1 <- a1$beta[,a1$lambda == cv.a1$lambda.min]
+  sol2 <- a1$beta[,a1$lambda == cv.a1$lambda.1se]
+  ar_1fused <- boro_set %>% mutate(beta = sol1, beta2 = sol2)
+  
+  for (i in 1:4) {
+    boro_set <- dataset[dataset$boro== levels(dataset$boro)[i],] 
+    a1 <- fusedlasso1d(boro_set$n_incident)
+    cv.a1 = cv.trendfilter(a1)
+    plot(cv.a1)
+    title(main=paste(levels(dataset$boro)[i]) )
+    boro_set <- boro_set %>% mutate(beta = a1$beta[,a1$lambda == cv.a1$lambda.min], beta2 = a1$beta[,a1$lambda == cv.a1$lambda.1se] )
+    
+    ar_1fused <- rbind(ar_1fused, boro_set)
+  }
+  return(ar_1fused)
+  }  
+
+ar_1fused <- fused_Boro(arrestBoro.time)
+```
+
+
+```{r, message=FALSE }
+library(gridExtra)
+p1 <- ggplot( ar_1fused, aes(x= time, y=beta, col= boro)) + geom_line() + ggtitle("Arrests with lambda.min") + theme( axis.title.y = element_blank()) + scale_colour_viridis_d() 
+
+p2 <- ggplot( ar_1fused, aes(x= time, y=beta2, col= boro)) + geom_line() + ggtitle("Arrests with lambda.1se") +  theme( axis.title.y = element_blank()) + scale_colour_viridis_d()
+
+grid.arrange(p1, p2, nrow = 2)
+```
+
+The plot with lambda.min shows the seasonal variability, while the larger lambda.1se smooth the signal showing the general time dependence.
+
+### Relative number of Arrests
+
+From above we see that the shape of the curve for each borough changes similarly in time. Lets then look at the monthly percentage of all incidents for a given borough:
+```{r}
+all_ar_month <- arrestH %>% group_by(time = floor_date( ARREST_DATE, 'month')) %>% summarize(n_month = n()) 
+arrestBoro.perc <- merge(arrestBoro.time, all_ar_month, all.x = TRUE) %>% mutate(n_p = n_incident/n_month) %>% subset( select = c("time", "boro", "n_p") ) 
+colnames(arrestBoro.perc) <-c("time", "boro", "n_incident")
+
+ggplot(arrestBoro.perc ,aes(x=time,y=n_incident, col=boro) )  +geom_line() + ggtitle("Percentage of arrests by borough") + theme( axis.title.y = element_blank())  + scale_y_continuous(labels = scales::percent) + scale_colour_viridis_d() # + geom_point() 
+```
+
+Smoothing the signal with fused lasso shows how the relative numbers of crimes in boroughs change in time:
+```{r, results='hide', message=FALSE}
+arp_1fused <- fused_Boro(arrestBoro.perc)
+```
+
+
+```{r}
+p3 <- ggplot( arp_1fused, aes(x= time, y=beta, col= boro))  + scale_y_continuous(labels = scales::percent)  + geom_line() + ggtitle("Arrest percent with lambda.min") + theme( axis.title.y = element_blank()) + scale_colour_viridis_d()
+
+p4 <- ggplot( arp_1fused, aes(x= time, y=beta2, col= boro))  + scale_y_continuous(labels = scales::percent)  + geom_line() + ggtitle("Arrest percent with lambdas given by the one standard error rule") + theme( axis.title.y = element_blank()) + scale_colour_viridis_d()
+grid.arrange(p3, p4, nrow = 2)
+```
+The relative number of arrest incidents in different boroughs in the city stays almost constant through the years.
+
+
+### 1.2 Shootings in boroughs
+
+Similar analysis can be done for shootings in different NYC boroughs. Number of shooting incidents in a month for a given borough:
+```{r, results='hide', message=FALSE, warning==FALSE}
+shootingBoro.time <- shooting %>% group_by(boro=BORO, time = floor_date( OCCUR_DATE, 'month')) %>% summarize(n_incident = n()) 
+ggplot(shootingBoro.time ,aes(x=time,y=n_incident, col=boro) ) + theme( axis.title.y = element_blank())  +geom_line() + ggtitle("Shootings in Boroughs") + scale_colour_viridis_d() # + geom_point() 
+```
+
+The monthly relative number of shooting incidents for a given borough:
+```{r}
+all_shoo_month <- shooting %>% group_by(time = floor_date( OCCUR_DATE, 'month')) %>% summarize(n_shooting_month = n()) 
+shootingBoro.perc <- merge(shootingBoro.time, all_shoo_month, all.x = TRUE) %>% mutate(n_p = n_incident/n_shooting_month) %>% subset( select = c("time", "boro", "n_p") )
+colnames(shootingBoro.perc) <-c("time", "boro", "n_incident")
+
+ggplot(shootingBoro.perc ,aes(x=time,y=n_incident, col=boro) )  +geom_line() + ggtitle("Percentage of shootings by borough") + theme( axis.title.y = element_blank())  + scale_y_continuous(labels = scales::percent) + scale_colour_viridis_d() # + geom_point() 
+```
+
+Smoothing with fused lasso:
+
+```{r, results='hide', message=FALSE}
+sh_1fused <- fused_Boro(shootingBoro.time)
+```
+
+```{r}
+p5 <- ggplot( sh_1fused, aes(x= time, y=beta[,1], col= boro)) + geom_line() + ggtitle("Shooting with lambda.min") + theme( axis.title.y = element_blank())  + scale_colour_viridis_d()
+p6 <- ggplot( sh_1fused, aes(x= time, y=beta2, col= boro)) + geom_line() + ggtitle("Shooting with lambdas given by the one standard error rule")  + theme( axis.title.y = element_blank())  + scale_colour_viridis_d()
+grid.arrange(p5, p6, nrow = 2)
+```
+
+As in the case of arrests, in the shooting data we see the seasonal differences in the number of incidents. 
+
+Smoothing the relative number of the shooting incidents in the boroughs:
+```{r, results='hide', message=FALSE}
+shp_1fused <- fused_Boro(shootingBoro.perc)
+```
+
+In the last case (QUEENS) the optimal lambda is on the border, thus one should pay more attention. We control that already for lambda close to 0.5 the smoothed signal is a constant line, so there is no point in checking even the larger values of lambdas (stronger penalty cannot flat the line even more). 
+
+
+Finally, we compare the regularized signals for the boroughs:
+
+```{r}
+p7 <- ggplot( shp_1fused, aes(x= time, y=beta, col= boro)) + geom_line() + ggtitle("Shooting percent with lambda.min") + theme( axis.title.y = element_blank())  + scale_y_continuous(labels = scales::percent)  + theme( axis.title.y = element_blank())+ scale_colour_viridis_d()
+p8 <- ggplot( shp_1fused, aes(x= time, y=beta2, col= boro)) + geom_line() + ggtitle("Shooting percent with lambdas given by the one standard error rule") + theme( axis.title.y = element_blank())  + scale_y_continuous(labels = scales::percent) + theme( axis.title.y = element_blank())+ scale_colour_viridis_d()
+grid.arrange(p7, p8, nrow = 2)
+```
+
+
+### 1.3 Comments
+
+From the analysis above we can conclude that:
+
+- There is a seasonal pattern present in the number of arrests and shooting incidents in each borough. There are fluctuations between summer with higher numbers and winters with more rare incidents. For the arrests data the seasonal differences are visible in the years before 2015, while afterwards the number of arrests is definitely decreasing and the seasonal differences are not present anymore. 
+
+- The two years of covid pandemic (2020-2021) are the years with less arrests and higher number of shootings, probably due to the lockdown. From then the number of monthly arrests grows, while the number of shooting incidents decreases (to the level from the years around 2013-17 and before 2013 in the case of Brooklyn and Bronx, respectively).
+
+
+
+
+
+## 2. Crime in Precincts
+
+### 2.1 Arrests
+
+By looking at the relative percentage of incidents in different boroughs one can conclude that on the level of boroughs the dangerous areas of the city are quite stable in time, also thought the seasons. Next one can check it also on the level of Arrest Precinct (there are 77 of them) and filter out the ones that have some significant differences. In this way one would show if and where there are the parts of the city where the crime situation is constantly bad through the years. In order to check their position and if they are close to each other we have to look at the 2dim maps.
+
+First we calculate the relative number of arrests in precincts
+```{r, results='hide', message=FALSE, warning=FALSE}
+# number of arrests in a given precinct per month
+arrestPrec.time <- arrestH  %>% group_by(prec = ARREST_PRECINCT, time = floor_date( ARREST_DATE, 'month')) %>% summarize(n_arrest = n()) 
+m= length(levels(arrestPrec.time$prec))
+
+# relative number of arrests in a given precinct per month
+arrestPrec.perc <- merge(arrestPrec.time, all_ar_month, all.x = TRUE) %>% mutate(n_p = n_arrest/n_month) %>% subset( select = c("time", "prec", "n_p") )
+
+ggplot(arrestPrec.perc ,aes(x=time,y=n_p, col=prec) )  + scale_y_continuous(labels = scales::percent) +geom_line()  +  theme( axis.title.y = element_blank()) + ggtitle("Percentage of arrests by precincts") + scale_colour_viridis_d()  
+```
+
+Smoothed with 1d fussed lasso:
+```{r, results='hide', message=FALSE}
+ar_p.prec_set <- arrestPrec.perc[arrestPrec.perc$prec== "1",] 
+c2 <- fusedlasso1d(ar_p.prec_set$n_p)
+cv.c2 = cv.trendfilter(c2)
+sol1 <- c2$beta[,c2$lambda == cv.c2$lambda.min]
+sol2 <- c2$beta[,c2$lambda == cv.c2$lambda.1se]
+arp.prec_1fused <- ar_p.prec_set %>% mutate(beta = sol1, beta2 = sol2)
+
+#par(mfrow=c(2,3))
+for (i in 2:m) {
+  ar_p.prec_set <- arrestPrec.perc[arrestPrec.perc$prec== levels(arrestPrec.time$prec)[i],] 
+  c2 <- fusedlasso1d(ar_p.prec_set$n_p)
+  cv.c2 = cv.trendfilter(c2)
+  #plot(cv.c2)
+  ar_p.prec_set <- ar_p.prec_set %>% mutate(beta = c2$beta[,c2$lambda == cv.c2$lambda.min], beta2 = c2$beta[,c2$lambda == cv.c2$lambda.1se] )
+  arp.prec_1fused <- rbind(arp.prec_1fused, ar_p.prec_set)
+}
+
+p9 <- ggplot( arp.prec_1fused, aes(x= time, y=beta, col= prec))  + scale_y_continuous(labels = scales::percent) + geom_line() + ggtitle("Relative arrests in precincts with lambda.min")  + theme( axis.title.y = element_blank(), legend.position="none")+ scale_colour_viridis_d()
+
+p10 <- ggplot( arp.prec_1fused, aes(x= time, y=beta2, col= prec))  + scale_y_continuous(labels = scales::percent) + geom_line() + ggtitle("Relative arrests in precincts with lambda.1se")  + theme( axis.title.y = element_blank(), legend.position="none")+ scale_colour_viridis_d()
+grid.arrange(p9, p10, nrow = 2)
+```
+
+Choosing the areas with more arrests:
+```{r}
+arrest.more <- arp.prec_1fused %>% group_by(prec) %>% summarize(beta.min = min(beta2), beta.max = max(beta2)) %>% filter( (beta.min > 0.015) | (beta.max > 0.025) ) %>% pull(prec)
+
+ggplot( arp.prec_1fused[arp.prec_1fused$prec %in% arrest.more,], aes(x= time, y=beta2, col= prec))  + scale_y_continuous(labels = scales::percent) + geom_line() + ggtitle("Relative arrest in the chosen precincts with lambda.1se") +  theme( axis.title.y = element_blank())+ scale_colour_viridis_d()
+```
+
+We see that there are only 14 (out of 77) precincts with regularized monthly number of arrests that is at least 1.5% of total arrests or that have a month when there occur more than 2.5% of total arrests. 
+
+To check where they are we plot the incidents in the chosen precincts
+```{r}
+ggplot() + geom_sf(data= nta, fill = "#69b3a2", color = "white", alpha=0.2) + theme_void() + geom_point(data = arrestH[arrestH$ARREST_PRECINCT  %in% arrest.more,],aes(x=Longitude,y=Latitude, col= ARREST_PRECINCT) , size = 0.5 ) + scale_colour_viridis_d()
+```
+
+### 2.2 Shootings in Precincts
+
+Similarly, we can find the precincts where shootings occur more often then elsewhere and the situation in constant in time. We calculate the relative number of monthly shooting incidents
+```{r, results='hide', message=FALSE, warning=FALSE}
+# montly shootings
+shootingPrec.time <- shooting %>% group_by(prec=PRECINCT, time = floor_date( OCCUR_DATE, 'month')) %>% summarize(n_shooting = n()) 
+# percent of monthly shootings
+shootingPrec.perc <- merge(shootingPrec.time, all_shoo_month, all.x = TRUE) %>% mutate(n_p = n_shooting/n_shooting_month) %>% subset( select = c("time", "prec", "n_p") )
+
+ggplot(shootingPrec.perc ,aes(x=time,y=n_p, col=prec) ) + scale_y_continuous(labels = scales::percent)  +geom_line()  + theme( axis.title.y = element_blank(), legend.position="none")  + ggtitle("Percentage of shootings by precincts")+ scale_colour_viridis_d() # + geom_point() 
+```
+
+
+Smoothed percentage of shootings:
+```{r, results='hide', message=FALSE}
+level.prec <-shootingPrec.perc %>% group_by(prec) %>% summarise(n_prec = n()) %>% filter(n_prec > 1) %>% pull(prec)
+
+sh_p.prec_set <- shootingPrec.perc[shootingPrec.perc$prec== "1",] 
+d2 <- fusedlasso1d(sh_p.prec_set$n_p)
+cv.d2 = cv.trendfilter(d2)
+sol1 <- d2$beta[,d2$lambda == cv.d2$lambda.min]
+sol2 <- d2$beta[,d2$lambda == cv.d2$lambda.1se]
+shp.prec_1fused <- sh_p.prec_set %>% mutate(beta = sol1, beta2 = sol2)
+m <- length(level.prec)
+for (i in 2:m) {
+  sh_p.prec_set <- shootingPrec.perc[shootingPrec.perc$prec== level.prec[i],] 
+  d2 <- fusedlasso1d(sh_p.prec_set$n_p)
+  cv.d2 = cv.trendfilter(d2)
+  sh_p.prec_set <- sh_p.prec_set %>% mutate(beta = d2$beta[,d2$lambda == cv.d2$lambda.min], beta2 = d2$beta[,d2$lambda == cv.d2$lambda.1se] )
+  shp.prec_1fused <- rbind(shp.prec_1fused, sh_p.prec_set)
+} 
+
+# plots
+p11 <- ggplot( shp.prec_1fused, aes(x= time, y=beta, col= prec)) + scale_y_continuous(labels = scales::percent)  +geom_line()  + theme( axis.title.y = element_blank(), legend.position="none")  + ggtitle("Relative shootings in precincts with lambda.min") + scale_colour_viridis_d()
+
+p12 <- ggplot( shp.prec_1fused, aes(x= time, y=beta2, col= prec)) + scale_y_continuous(labels = scales::percent)  +geom_line()  + theme( axis.title.y = element_blank(), legend.position="none")  + ggtitle("Relative shootings in precincts with lambda.1se") + scale_colour_viridis_d()
+grid.arrange(p11, p12, nrow = 2)
+```
+
+Choosing the areas with more shootings such that the regularized monthly number of shootings is:   
+- at least 2.5% of total shootings or that have a month when there occur more than 3% of total shootings in the case of lambda.min.  
+- at least 3% of total shootings in the case of lambda.1se
+
+```{r}
+shooting.more <- shp.prec_1fused %>% group_by(prec) %>% summarize(beta.min = min(beta2), beta.max = max(beta2)) %>% filter( (beta.min > 0.03) ) %>% pull(prec)
+
+shooting.more2 <- shp.prec_1fused %>% group_by(prec) %>% summarize(beta.min = min(beta), beta.max = max(beta)) %>% filter( (beta.min > 0.025) | (beta.max > 0.03) ) %>% pull(prec)
+
+ggplot( shp.prec_1fused[shp.prec_1fused$prec %in% shooting.more,], aes(x= time, y=beta2, col= prec)) +  scale_y_continuous(labels = scales::percent)  +geom_line()  + theme( axis.title.y = element_blank())  + ggtitle("Relative shootings in the chosen precincts (for lambda.1se)") + scale_colour_viridis_d()
+
+ggplot( shp.prec_1fused[shp.prec_1fused$prec %in% shooting.more2,], aes(x= time, y=beta, col= prec)) + scale_y_continuous(labels = scales::percent)  +geom_line()  + theme( axis.title.y = element_blank()) + ggtitle("Relative shootings in the chosen precincts (for lambda.min)")+ scale_colour_viridis_d()
+
+```
+
+To check where the dangerous areas are we plot the shooting incidents in the chosen precincts
+```{r}
+ggplot() + geom_sf(data= nta, fill = "#69b3a2", color = "white", alpha=0.3) + theme_void() + geom_point(data= shooting[shooting$PRECINCT  %in% shooting.more,],aes(x=Longitude,y=Latitude, col= PRECINCT), size = 0.5 )  + ggtitle("Relative shootings in the chosen precincts (for lambda.min)")+ scale_colour_viridis_d()
+
+ggplot() + geom_sf(data= nta, fill = "#69b3a2", color = "white", alpha=0.3) + theme_void() + geom_point(data =shooting[shooting$PRECINCT  %in% shooting.more2,],aes(x=Longitude,y=Latitude, col= PRECINCT), size = 0.5 )  + ggtitle("Relative shootings in the chosen precincts (for lambda.1se)")+ scale_colour_viridis_d()
+```
+
+By comparing the above with the map of all shooting incidents in years 2006-2023, we see that the selection of the precincts permanently dangerous in time, based on fused lasso with lambda.min (highest 14 out of 77 precincts), seems reasonable: 
+
+```{r}
+ggplot() + geom_sf(data=nta, fill ="#69b3a2", color = "black", alpha=0.1) + theme_void() + geom_point(data=shooting,aes(x = Longitude, y = Latitude, col = BORO), size = 0.05)+ scale_colour_viridis_d()
+```
+
+
